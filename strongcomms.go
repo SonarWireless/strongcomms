@@ -49,7 +49,7 @@ import (
 
 	"fmt"
 
-	"./lru"
+	"github.com/SonarWireless/strongcomms/lru"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
