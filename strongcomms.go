@@ -49,7 +49,7 @@ import (
 
 	"fmt"
 
-	"github.com/j-forristal/strongcomms/lru"
+	"./lru"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
