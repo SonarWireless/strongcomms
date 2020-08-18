@@ -637,7 +637,7 @@ func (s *Client) SetCache(hostname string, ips []net.IP) {
 	}
 }
 
-// Legacy function that simply calls TestNetworkWithContext() using a calculated
+// TestNetwork is a legacy function that simply calls TestNetworkWithContext() using a calculated
 // timeout of DefaultTimeoutDOH * the number of configured DOH servers.
 func (s *Client) TestNetwork() bool {
 	if len(s.DOHServers) == 0 {
@@ -651,7 +651,7 @@ func (s *Client) TestNetwork() bool {
 	return s.TestNetworkWithContext(ctx)
 }
 
-// Utility function to 'test' the network by attempting a TCP connection (IPv4) to
+// TestNetworkWithContext is a utility function to 'test' the network by attempting a TCP connection (IPv4) to
 // the configured DOH server(s). This function will internally keep trying until
 // either a successful connection is made, or the given context triggers a timeout,
 // deadline, or cancel.
@@ -681,7 +681,7 @@ func (s *Client) TestNetworkWithContext(ctx context.Context) bool {
 				return true
 			}
 
-			if err == context.Canceled || err == context.DeadlineExceeded {
+			if ctxErr := ctx.Err(); ctxErr == context.Canceled || ctxErr == context.DeadlineExceeded {
 				// Context says we are done
 				if s.TraceCallback != nil {
 					s.TraceCallback(fmt.Sprintf("%s Context cancelled/timed out", TagNetworkTest))
@@ -691,6 +691,9 @@ func (s *Client) TestNetworkWithContext(ctx context.Context) bool {
 
 			// Swallow all other errors and try next one
 			// Loop...
+
+			// make CPU happy
+			time.Sleep(time.Millisecond * 100)
 		}
 	}
 }
