@@ -36,7 +36,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
+	"fmt"
 	"io/ioutil"
 	"math/big"
 	"net"
@@ -46,8 +46,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"fmt"
 
 	"github.com/SonarWireless/strongcomms/lru"
 	"golang.org/x/net/dns/dnsmessage"
@@ -102,6 +100,8 @@ type Client struct {
 	CountDOHResponseErrors    uint32
 	CountDOHParsingErrors     uint32
 	CountDOHOperationalErrors uint32
+	CountDOHNoAnswers         uint32
+	CountDOHOk                uint32
 	CountDOHResumed           uint32
 	CountHTTPSResumed         uint32
 	cache                     *lru.Cache
@@ -222,14 +222,14 @@ func New(cfg Config) (*Client, error) {
 	// Create our default DOH cert pool
 	dohCertPool := x509.NewCertPool()
 	if !dohCertPool.AppendCertsFromPEM(CertsDOH) {
-		return nil, errors.New("Unable to load DOH certs")
+		return nil, fmt.Errorf("Unable to load DOH certs")
 	}
 
 	// SPECIAL: if custom HTTPS proxy certs are being used, we need to add them to
 	// the DOH cert pool too, so DOH looks work through the proxy.
 	if cfg.ProxyConfig != nil && cfg.ProxyConfig.Url != "" && len(cfg.ProxyConfig.CertsPEM) > 0 {
 		if !dohCertPool.AppendCertsFromPEM(cfg.ProxyConfig.CertsPEM) {
-			return nil, errors.New("Unable to load proxy certs into DOH cert pool")
+			return nil, fmt.Errorf("Unable to load proxy certs into DOH cert pool")
 		}
 	}
 
@@ -243,7 +243,7 @@ func New(cfg Config) (*Client, error) {
 		} else { // Explicitly set the proxy
 			url, err := url.Parse(cfg.ProxyConfig.Url)
 			if err != nil {
-				return nil, errors.New("Unable to parse proxy URL: " + err.Error())
+				return nil, fmt.Errorf("Unable to parse proxy URL: %w", err)
 			}
 			proxy = http.ProxyURL(url)
 		}
@@ -271,7 +271,7 @@ func New(cfg Config) (*Client, error) {
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				doh, ok := ctx.Value(contextKeyDOH).(*DOHServer)
 				if !ok {
-					return nil, errors.New("No DOH context")
+					return nil, fmt.Errorf("No DOH context")
 				}
 
 				// Specifically switch the lookup to IPv4:
@@ -349,11 +349,16 @@ func New(cfg Config) (*Client, error) {
 		// Look up (IPv4) IP addresses via DOH
 		ips, err := c.LookupIP(host) // Our own DOH lookup
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("Strongcomms DOH lookup: %w", err)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("Strongcomms DOH lookup: no answers")
 		}
 
 		// Sequentially try each returned IP address, until we get a valid connection
-		var conn net.Conn
+		var (
+			conn net.Conn
+		)
 		for _, ip = range ips {
 			if ip.To4() == nil {
 				continue
@@ -365,16 +370,12 @@ func New(cfg Config) (*Client, error) {
 			}
 			conn, err = net.DialTimeout(network, addr, cfg.TimeoutHTTPSSetup)
 			if err == nil {
-				return conn, err
+				return conn, nil
 			}
 			// Errored, try next IP (loop)
 		}
 
-		// If we get here, we got no IPs or did not connect
-		if len(ips) == 0 {
-			return nil, errors.New("Unable to resolve hostname")
-		}
-		return nil, errors.New("Unable to dial/connect")
+		return nil, fmt.Errorf("Strongcomms client dial: %w", err)
 	}
 
 	// Now we need to configure our TLS client values.
@@ -424,21 +425,21 @@ func New(cfg Config) (*Client, error) {
 		// Use a custom RootCA pool having just Cloudfront certs
 		cloudfrontCertPool := x509.NewCertPool()
 		if !cloudfrontCertPool.AppendCertsFromPEM(CertsCloudfront) {
-			return nil, errors.New("Unable to load Cloudfront certs")
+			return nil, fmt.Errorf("Unable to load Cloudfront certs")
 		}
 
 		// SPECIAL: if custom HTTPS proxy certs are being used, we need to add them to
 		// the cloudfront cert pool too
 		if cfg.ProxyConfig != nil && cfg.ProxyConfig.Url != "" && len(cfg.ProxyConfig.CertsPEM) > 0 {
 			if !cloudfrontCertPool.AppendCertsFromPEM(cfg.ProxyConfig.CertsPEM) {
-				return nil, errors.New("Unable to load proxy certs into RootCA cert pool")
+				return nil, fmt.Errorf("Unable to load proxy certs into RootCA cert pool")
 			}
 		}
 
 		tr.TLSClientConfig.RootCAs = cloudfrontCertPool
 
 	default:
-		return nil, errors.New("Bad cert validation type")
+		return nil, fmt.Errorf("Bad cert validation type")
 	}
 
 	if usingSystemCertPool {
@@ -510,16 +511,16 @@ func urlIsProxied(proxy func(*http.Request) (*url.URL, error), testUrl string) b
 
 type Dialer func(network, addr string) (net.Conn, error)
 
-var ErrorTLSPinViolation error = errors.New("TLS pin violation")
+var ErrorTLSPinViolation error = fmt.Errorf("TLS pin violation")
 
 func makePinnedDialer(s *Client, cfg *Config) (Dialer, error) {
 
 	if len(cfg.CertValidationPins) == 0 {
-		return nil, errors.New("Pin(s) required")
+		return nil, fmt.Errorf("Pin(s) required")
 	}
 	for _, pin := range cfg.CertValidationPins {
 		if len(pin) != 32 { // SHA256 == 32 bytes
-			return nil, errors.New("Bad pin length")
+			return nil, fmt.Errorf("Bad pin length")
 		}
 	}
 	s.HTTPSPins = cfg.CertValidationPins
@@ -582,10 +583,10 @@ func makePinnedDialer(s *Client, cfg *Config) (Dialer, error) {
 func AppendPEMCert(pem []byte, client *http.Client) error {
 	var tr *http.Transport = client.Transport.(*http.Transport)
 	if tr == nil {
-		return errors.New("HTTP transport required")
+		return fmt.Errorf("HTTP transport required")
 	}
 	if tr.TLSClientConfig == nil {
-		return errors.New("An explicit TLSClientConfig is required")
+		return fmt.Errorf("An explicit TLSClientConfig is required")
 	}
 
 	// If the config is using the default system cert pool, we need to
@@ -598,7 +599,7 @@ func AppendPEMCert(pem []byte, client *http.Client) error {
 	}
 
 	if !tr.TLSClientConfig.RootCAs.AppendCertsFromPEM(pem) {
-		return errors.New("Unable to load cert into RootCA cert pool")
+		return fmt.Errorf("Unable to load cert into RootCA cert pool")
 	}
 
 	return nil
@@ -711,7 +712,7 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 		if ip != nil {
 			return []net.IP{ip}, nil
 		}
-		return nil, errors.New("IPv6 not supported")
+		return nil, fmt.Errorf("IPv6 not supported")
 	}
 
 	// Make sure hostname is normalized and ends with trailing period
@@ -735,7 +736,7 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 		Class: dnsmessage.ClassINET,
 	}
 	if q.Name, err = dnsmessage.NewName(hostname); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s dns message construction: %w", TagDOH, err)
 	}
 
 	// FUTURE-TODO: RFC7871 EDNS0 Client Subnet, and
@@ -743,7 +744,7 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 
 	id, err := rand.Int(rand.Reader, big.NewInt(65535))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s random: %w", TagDOH, err)
 	}
 	msg := dnsmessage.Message{
 		Header: dnsmessage.Header{
@@ -754,15 +755,18 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 	}
 
 	if body, err = msg.Pack(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s packing DNS message: %w", TagDOH, err)
 	}
 
 	s.l.Lock()
 	currentServers := s.DOHServers
 	s.l.Unlock()
 
-	var responseBody []byte
-	var dohServer *DOHServer
+	var (
+		dohServer *DOHServer
+		hostIPs   []net.IP
+		ttl       uint32
+	)
 	for _, dohServer = range currentServers {
 
 		request, err := http.NewRequest("POST", dohServer.Url, bytes.NewBuffer(body))
@@ -770,7 +774,7 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 			// Error in request construction is likely a configuration problem,
 			// so abort (for error feedback) rather than continuing to
 			// next sever in list
-			return nil, err
+			return nil, fmt.Errorf("%s constructing DOH POST request: %w", TagDOH, err)
 		}
 		request.Header.Del("User-Agent") // Do not expose our user-agent/version
 		request.Header.Add("Accept", appDNSMessage)
@@ -829,11 +833,14 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 		// NOTE: we should technically use a limiting reader here, but we are
 		// doing to accept the risk given we do not expect the DOH server to
 		// DoS us by returning a large response.
-		responseBody, err = ioutil.ReadAll(response.Body)
+		responseBody, err := ioutil.ReadAll(response.Body)
 		response.Body.Close()
 		cancel() // All done with request
 		if err != nil || len(responseBody) == 0 {
 			atomic.AddUint32(&s.CountDOHResponseErrors, 1)
+			if s.DOHErrorCallback != nil {
+				s.DOHErrorCallback(TagDOH, hostname, err)
+			}
 			continue
 		}
 
@@ -844,87 +851,113 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 			}
 		}
 
-		break // We got a response, so we do not need to loop to next server
-	}
-
-	// Did we get a response?
-	if len(responseBody) == 0 {
-		atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
-		return nil, errors.New(TagDOH + " no answers for " + hostname)
-	}
-
-	// Parse the response (a DNS message)
-	var p dnsmessage.Parser
-	var responseHeader dnsmessage.Header
-	if responseHeader, err = p.Start(responseBody); err != nil {
-		atomic.AddUint32(&s.CountDOHParsingErrors, 1)
-		return nil, err
-	}
-
-	if responseHeader.RCode != dnsmessage.RCodeSuccess {
-		atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
-		return nil, errors.New(TagDOH + " lookup returned non-success")
-	}
-	if !responseHeader.Response {
-		atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
-		return nil, errors.New(TagDOH + " response was not marked as response")
-	}
-	if responseHeader.ID != msg.Header.ID {
-		atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
-		return nil, errors.New(TagDOH + " lookup returned bad ID")
-	}
-	if responseHeader.Truncated {
-		atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
-		return nil, errors.New(TagDOH + " response was truncated")
-	}
-
-	if err = p.SkipAllQuestions(); err != nil {
-		atomic.AddUint32(&s.CountDOHParsingErrors, 1)
-		return nil, err
-	}
-
-	// Now parse answers
-	var hostIPs []net.IP
-	var ttl uint32
-	for {
-		ah, err := p.AnswerHeader()
-		if err == dnsmessage.ErrSectionDone {
-			break
-		}
-		if err != nil {
+		// Parse the response (a DNS message)
+		var (
+			p              dnsmessage.Parser
+			responseHeader dnsmessage.Header
+		)
+		if responseHeader, err = p.Start(responseBody); err != nil {
 			atomic.AddUint32(&s.CountDOHParsingErrors, 1)
-			return hostIPs, err
-		}
-
-		if ah.Type != q.Type || ah.Class != q.Class {
-			if err = p.SkipAnswer(); err != nil {
-				atomic.AddUint32(&s.CountDOHParsingErrors, 1)
-				return hostIPs, err
+			if s.DOHErrorCallback != nil {
+				s.DOHErrorCallback(TagDOH, hostname, err)
 			}
 			continue
 		}
 
-		if !strings.EqualFold(ah.Name.String(), hostname) {
-			if err = p.SkipAnswer(); err != nil {
-				atomic.AddUint32(&s.CountDOHParsingErrors, 1)
-				return hostIPs, err
+		if responseHeader.RCode != dnsmessage.RCodeSuccess {
+			atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
+			if s.DOHErrorCallback != nil {
+				s.DOHErrorCallback(TagDOH, hostname, fmt.Errorf("lookup returned non-success"))
+			}
+			continue
+		}
+		if !responseHeader.Response {
+			atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
+			if s.DOHErrorCallback != nil {
+				s.DOHErrorCallback(TagDOH, hostname, fmt.Errorf("response was not marked as a response"))
+			}
+			continue
+		}
+		if responseHeader.ID != msg.Header.ID {
+			atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
+			if s.DOHErrorCallback != nil {
+				s.DOHErrorCallback(TagDOH, hostname, fmt.Errorf("lookup returned bad ID"))
+			}
+			continue
+		}
+		if responseHeader.Truncated {
+			atomic.AddUint32(&s.CountDOHOperationalErrors, 1)
+			if s.DOHErrorCallback != nil {
+				s.DOHErrorCallback(TagDOH, hostname, fmt.Errorf("response was truncated"))
 			}
 			continue
 		}
 
-		if ah.Type == dnsmessage.TypeA {
-			r, err := p.AResource()
+		if err = p.SkipAllQuestions(); err != nil {
+			atomic.AddUint32(&s.CountDOHParsingErrors, 1)
+			if s.DOHErrorCallback != nil {
+				s.DOHErrorCallback(TagDOH, hostname, err)
+			}
+			continue
+		}
+
+		// Now parse answers
+		for {
+			ah, err := p.AnswerHeader()
+			if err == dnsmessage.ErrSectionDone {
+				break
+			}
 			if err != nil {
 				atomic.AddUint32(&s.CountDOHParsingErrors, 1)
-				return hostIPs, err
+				if s.DOHErrorCallback != nil {
+					s.DOHErrorCallback(TagDOH, hostname, err)
+				}
+				break
 			}
-			hostIPs = append(hostIPs, r.A[:])
-			ttl = ah.TTL
+
+			if ah.Type != q.Type || ah.Class != q.Class {
+				if err = p.SkipAnswer(); err != nil {
+					atomic.AddUint32(&s.CountDOHParsingErrors, 1)
+					if s.DOHErrorCallback != nil {
+						s.DOHErrorCallback(TagDOH, hostname, err)
+					}
+					break
+				}
+				continue
+			}
+
+			if !strings.EqualFold(ah.Name.String(), hostname) {
+				if err = p.SkipAnswer(); err != nil {
+					atomic.AddUint32(&s.CountDOHParsingErrors, 1)
+					if s.DOHErrorCallback != nil {
+						s.DOHErrorCallback(TagDOH, hostname, err)
+					}
+					break
+				}
+				continue
+			}
+
+			if ah.Type == dnsmessage.TypeA {
+				r, err := p.AResource()
+				if err != nil {
+					atomic.AddUint32(&s.CountDOHParsingErrors, 1)
+					if s.DOHErrorCallback != nil {
+						s.DOHErrorCallback(TagDOH, hostname, err)
+					}
+					break
+				}
+				hostIPs = append(hostIPs, r.A[:])
+				ttl = ah.TTL
+			}
+		}
+
+		if len(hostIPs) > 0 {
+			break // We got a response, so we do not need to loop to next server
 		}
 	}
 
-	// Cache this answer, factoring in the TTL vs. our minimum cache time
 	if len(hostIPs) > 0 {
+		// Cache this answer, factoring in the TTL vs. our minimum cache time
 		expire := time.Now()
 		ttlDuration := time.Second * time.Duration(ttl)
 		if ttlDuration > DefaultMinimumDOHCacheTime {
@@ -936,26 +969,32 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 			ips:     hostIPs,
 			timeout: expire,
 		})
-	}
 
-	// Since this DOH server gave us a parseable answer, move it to the front
-	// of the line for next time
-	if currentServers[0] != dohServer {
-		newServers := make([]*DOHServer, 0, len(currentServers))
-		newServers = append(newServers, dohServer)
-		for _, s := range currentServers {
-			if s == dohServer {
-				continue
+		// Since this DOH server gave us a parseable answer, move it to the front
+		// of the line for next time
+		if currentServers[0] != dohServer {
+			newServers := make([]*DOHServer, 0, len(currentServers))
+			newServers = append(newServers, dohServer)
+			for _, s := range currentServers {
+				if s == dohServer {
+					continue
+				}
+				newServers = append(newServers, s)
 			}
-			newServers = append(newServers, s)
+
+			s.l.Lock()
+			s.DOHServers = newServers
+			s.l.Unlock()
 		}
 
-		s.l.Lock()
-		s.DOHServers = newServers
-		s.l.Unlock()
-	}
+		atomic.AddUint32(&s.CountDOHOk, 1)
+		return hostIPs, nil
 
-	return hostIPs, nil
+	} else {
+
+		atomic.AddUint32(&s.CountDOHNoAnswers, 1)
+		return nil, fmt.Errorf("%s no answers for %s", TagDOH, hostname)
+	}
 }
 
 // Perform an HTTP(S) request, similar to http.Client.Do().
@@ -998,7 +1037,7 @@ func (s *Client) GetTimeWithContext(tm time.Time, ctx context.Context) (time.Tim
 
 	certPool := x509.NewCertPool()
 	if !certPool.AppendCertsFromPEM(CertsDOH) {
-		return tm, errors.New("Unable to load DOH certs")
+		return tm, fmt.Errorf("Unable to load DOH certs")
 	}
 
 	// TODO: use multiple sources and correlate, to avoid a single-source
@@ -1073,7 +1112,7 @@ func (s *Client) getTimeSingle(tm time.Time, u, hostAddr string, roots *x509.Cer
 
 			tm2 := parseDate(response.Header.Get("Date"))
 			if tm2.IsZero() {
-				return *tmPtr, errors.New("Response did not include usable date")
+				return *tmPtr, fmt.Errorf("Response did not include usable date")
 			}
 			if s.TraceCallback != nil {
 				s.TraceCallback(fmt.Sprintf("%s Time from server:%v", TagNetworkTime, tm2))
