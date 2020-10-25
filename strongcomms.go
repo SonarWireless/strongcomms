@@ -47,7 +47,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/SonarWireless/strongcomms/lru"
+	"github.com/golang/groupcache/lru"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -103,7 +103,10 @@ type Client struct {
 	CountDOHNoAnswers         uint32
 	CountDOHOk                uint32
 	CountDOHResumed           uint32
-	CountHTTPSResumed         uint32
+	CountClientResumed        uint32
+	CountClientRequests       uint32
+	CountClientOk             uint32
+	CountClientErrors         uint32
 	cache                     *lru.Cache
 	l                         sync.Mutex
 }
@@ -150,6 +153,9 @@ type Config struct {
 
 	// UseGoogleDOH, when true, will configure default Google DOH support
 	UseGoogleDOH bool
+
+	// UseQuad9DOH, when true, will configure default Quad9 DOH support
+	UseQuad9DOH bool
 
 	// TimeoutDOH controls DOH lookup timeout; if not set, DefaultTimeoutDOH will be used
 	TimeoutDOH time.Duration
@@ -281,15 +287,25 @@ func New(cfg Config) (*Client, error) {
 
 				// If we are using a proxy, we need to dial the proxy, not the DOH server
 				dialAddr := doh.Dial
+				usingProxy := false
 				if proxy != nil && urlIsProxied(proxy, doh.Url) { //  NOTE: proxy is a closure variable
 					dialAddr = addr
+					usingProxy = true
 				}
 
 				// NOTE: net.DialTimeout will use normal DNS to resolve DOH server hostnames:
 				if c.TraceCallback != nil {
 					c.TraceCallback(fmt.Sprintf("%s Dial %s:%s", TagDOH, network, dialAddr))
 				}
-				return net.DialTimeout(network, dialAddr, doh.Timeout)
+				conn, err := net.DialTimeout(network, dialAddr, doh.Timeout)
+				if err != nil {
+					if usingProxy {
+						err = fmt.Errorf("%s-Proxy dial: %w", TagDOH, err)
+					} else {
+						err = fmt.Errorf("%s dial: %w", TagDOH, err)
+					}
+				}
+				return conn, err
 			},
 		},
 	}
@@ -349,10 +365,10 @@ func New(cfg Config) (*Client, error) {
 		// Look up (IPv4) IP addresses via DOH
 		ips, err := c.LookupIP(host) // Our own DOH lookup
 		if err != nil {
-			return nil, fmt.Errorf("Strongcomms DOH lookup: %w", err)
+			return nil, fmt.Errorf("%s lookup: %w", TagDOH, err)
 		}
 		if len(ips) == 0 {
-			return nil, fmt.Errorf("Strongcomms DOH lookup: no answers")
+			return nil, fmt.Errorf("%s lookup: no answers", TagDOH)
 		}
 
 		// Sequentially try each returned IP address, until we get a valid connection
@@ -375,7 +391,7 @@ func New(cfg Config) (*Client, error) {
 			// Errored, try next IP (loop)
 		}
 
-		return nil, fmt.Errorf("Strongcomms client dial: %w", err)
+		return nil, fmt.Errorf("%s dial: %w", TagClient, err)
 	}
 
 	// Now we need to configure our TLS client values.
@@ -487,6 +503,21 @@ func New(cfg Config) (*Client, error) {
 			Timeout: cfg.TimeoutDOH,
 			Url:     "https://dns.google/dns-query",
 			Dial:    "8.8.4.4:443",
+		})
+	}
+	if cfg.UseQuad9DOH {
+		// NOTE: we use dns10 which does not do any malicious destination blocking,
+		// because it would be a silent bug if Quad9 filtering blocked some destination
+		// any parent user of this lib wants to connect to ... including malicious.
+		c.DOHServers = append(c.DOHServers, &DOHServer{
+			Timeout: cfg.TimeoutDOH,
+			Url:     "https://dns10.quad9.net/dns-query",
+			Dial:    "9.9.9.10:5053",
+		})
+		c.DOHServers = append(c.DOHServers, &DOHServer{
+			Timeout: cfg.TimeoutDOH,
+			Url:     "https://dns10.quad9.net/dns-query",
+			Dial:    "149.112.112.10:5053",
 		})
 	}
 
@@ -1000,7 +1031,12 @@ func (s *Client) LookupIP(hostname string) ([]net.IP, error) {
 // Perform an HTTP(S) request, similar to http.Client.Do().
 func (s *Client) Do(r *http.Request) (*http.Response, error) {
 
+	atomic.AddUint32(&s.CountClientRequests, 1)
 	resp, err := s.ClientHTTPS.Do(r)
+
+	if resp.TLS != nil && resp.TLS.DidResume {
+		atomic.AddUint32(&s.CountClientResumed, 1)
+	}
 
 	// Intercept and report certain errors
 	if err != nil && s.TLSErrorCallback != nil {
@@ -1021,6 +1057,12 @@ func (s *Client) Do(r *http.Request) (*http.Response, error) {
 	}
 
 	// Otherwise pass through
+	if err != nil {
+		atomic.AddUint32(&s.CountClientErrors, 1)
+		err = fmt.Errorf("[host=%s]: %w", r.URL.Host, err)
+	} else {
+		atomic.AddUint32(&s.CountClientOk, 1)
+	}
 	return resp, err
 }
 
