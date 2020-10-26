@@ -1,4 +1,4 @@
-module github.com/j-forristal/strongcomms
+module github.com/SonarWireless/strongcomms
 
 go 1.14
 
